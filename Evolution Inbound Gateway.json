@@ -1,0 +1,663 @@
+{
+  "name": "Evolution Inbound Gateway",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "evo/inbound",
+        "options": {
+          "rawBody": true,
+          "responseData": "{\"ok\":true}"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -496,
+        -16
+      ],
+      "id": "65b29385-60a8-4802-a40f-f8cd88e45b4c",
+      "name": "Evolution Inbound",
+      "webhookId": "305d51b6-c1e8-4f07-8cd0-6eda9a7fbeef"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT value->>'phone_e164' AS phone_e164\nFROM wa_session_kv\nWHERE session_key = $1;\n",
+        "options": {
+          "queryReplacement": "={{ $json.sessionid }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        624,
+        -16
+      ],
+      "id": "6a97c756-1b2f-4dcb-8adf-1e4693847dd9",
+      "name": "KV · GET phone",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "DwauFRss86aEyyfD",
+          "name": "n8n database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const got = $input.all()[0]?.json?.data?.[0]; // Postgres v2 devuelve {data:[rows], ...}\nconst phone = got?.phone_e164 || null;\nreturn [{ json: { ...$json, phone_e164: phone } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1072,
+        -16
+      ],
+      "id": "644a601f-4822-4059-8579-45c1a84f064d",
+      "name": "Merge phone from KV (if any)"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code node (JavaScript) — Signals → candidate_phone (con KV prioridad 1)\n * INPUTS:\n *   - Upstream A: $('Merge config → env')  → envelope(s) con {ctx, signals, vcard, env}\n *   - Upstream B: $input.first().json.phone_e164  → número desde la DB (KV)\n *\n * OUTPUT: mismo envelope + { number_candidates[], candidate_phone_e164, candidate_source }\n * Regla: si viene phone_e164 desde la DB, va PRIMERO como candidato 'kv'.\n */\n\nfunction e164(s) {\n  if (!s) return null;\n  const d = String(s).replace(/[^\\d+]/g, '');\n  if (!d) return null;\n  return d.startsWith('+') ? d : ('+' + d);\n}\nfunction jidToE164(jid) {\n  if (!jid || !/@s\\.whatsapp\\.net$/i.test(jid)) return null;\n  return e164(jid.split('@')[0]);\n}\n\n/** Parser vCard con soporte de \"itemX.TEL;waid=...:+54 ...\" */\nfunction parseVCard(v) {\n  if (!v || typeof v !== 'string') return null;\n  const lines = v\n    .replace(/\\r\\n/g, '\\n')\n    .replace(/\\n[ \\t]/g, '')\n    .split('\\n')\n    .map(s => s.trim())\n    .filter(Boolean);\n\n  const out = { raw: v, phones: [] };\n\n  for (const ln of lines) {\n    const [lhsFull, rhsRaw = ''] = ln.split(/:(.*)/s);\n    if (!lhsFull) continue;\n    const rhs = rhsRaw.trim();\n\n    const lhsCore = lhsFull.includes('.') ? lhsFull.slice(lhsFull.lastIndexOf('.') + 1) : lhsFull;\n    const [baseKeyRaw, ...paramParts] = lhsCore.split(';');\n    const baseKey = (baseKeyRaw || '').toUpperCase();\n\n    if (baseKey !== 'TEL') continue;\n\n    const params = {};\n    for (const pp of paramParts) {\n      const [k, v] = pp.split('=');\n      if (!k) continue;\n      params[k.trim().toLowerCase()] = (v || '').trim();\n    }\n\n    const waid = params['waid'] || null;       // ej: 5492235994874\n    const waid_e164 = waid ? e164(waid) : null;\n    const value_e164 = e164(rhs);              // ej: \"+54 9 223 ...\"\n    out.phones.push({ waid, waid_e164, value_e164 });\n  }\n  return out;\n}\n\nfunction buildCandidates({ vcardRaw, ctx, env }) {\n  const cands = [];\n\n  // 1-2) vCard: waid primero, luego tel\n  if (vcardRaw) {\n    const v = parseVCard(vcardRaw);\n    if (v?.phones?.length) {\n      for (const ph of v.phones) {\n        if (ph.waid_e164) cands.push({ source: 'vcard.waid', phone_e164: ph.waid_e164 });\n        if (ph.value_e164) cands.push({ source: 'vcard.tel',  phone_e164: ph.value_e164 });\n      }\n    }\n  }\n\n  // 3) participant\n  const cPart = jidToE164(ctx?.participant || null);\n  if (cPart) cands.push({ source: 'participant', phone_e164: cPart });\n\n  // 4) quoted\n  const cQ = jidToE164(ctx?.quoted_participant || ctx?.quotedPart || null);\n  if (cQ) cands.push({ source: 'quoted.participant', phone_e164: cQ });\n\n  // 5) mentioned[]\n  const mArr = Array.isArray(ctx?.mentioned) ? ctx.mentioned : [];\n  for (const mj of mArr) {\n    const cM = jidToE164(mj);\n    if (cM) cands.push({ source: 'mentioned', phone_e164: cM });\n  }\n\n  // 6) senderJid (evitar owner y 1:1 @lid)\n  const isLidOneToOne = (ctx?.remoteJid || '').endsWith('@lid') && !ctx?.fromMe;\n  const owner = env?.owner_jid || '';\n  if (!isLidOneToOne && ctx?.senderJid && ctx.senderJid !== owner) {\n    const cS = jidToE164(ctx.senderJid);\n    if (cS) cands.push({ source: 'senderJid', phone_e164: cS });\n  }\n\n  // 7) número crudo en texto\n  const text = ctx?.message_text || ctx?.text || '';\n  if (text) {\n    const m = text.match(/(\\+?\\d{8,15})/);\n    if (m) {\n      const e = e164(m[1]);\n      if (e) cands.push({ source: 'text', phone_e164: e });\n    }\n  }\n\n  return cands;\n}\n\n// ------- MAIN -------\n// 1) Tomar el número desde la DB (entrada directa del nodo): PRIORIDAD 1\nconst kvPhoneRaw = $input.first()?.json?.phone_e164 || null;\nconst kvPhone = e164(kvPhoneRaw);\n\n// 2) Iterar los envelopes provenientes de \"Merge config → env\"\nconst out = [];\nfor (const item of $('Merge config → env').all()) {\n  const env     = item.json.env || {};\n  const ctx     = item.json.ctx || {};\n  const signals = item.json.signals || {};\n  const vcardRaw = signals?.isVCard ? (item.json.vcard?.raw || null) : null;\n\n  // candidatos por señales\n  const fromSignals = buildCandidates({ vcardRaw, ctx, env });\n\n  // combinar, poniendo KV primero si existe\n  const combined = [];\n  if (kvPhone) combined.push({ source: 'kv', phone_e164: kvPhone });\n  combined.push(...fromSignals);\n\n  // dedup preservando orden\n  const seen = new Set();\n  const number_candidates = combined.filter(x => {\n    if (!x || !x.phone_e164) return false;\n    if (seen.has(x.phone_e164)) return false;\n    seen.add(x.phone_e164);\n    return true;\n  });\n\n  const best = number_candidates[0] || null;\n\n  out.push({\n    json: {\n      ...item.json,\n      number_candidates,\n      candidate_phone_e164: best?.phone_e164 || null,\n      candidate_source: best?.source || null\n    }\n  });\n}\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        848,
+        -16
+      ],
+      "id": "ffa69e32-c724-49ad-9df1-ca2f41bebfba",
+      "name": "Signals → candidate_phone"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "009edd0d-829b-4ad8-8d16-dd5dc413f099",
+              "leftValue": "={{ $json.candidate_phone_e164 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1296,
+        -16
+      ],
+      "id": "7d4d5327-9987-489a-997d-04a8314498d3",
+      "name": "¿Hay candidate_phone?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wa_session_kv (session_key, value, version, updated_at, expires_at)\nVALUES ($1, jsonb_build_object('phone_e164',$2::text, 'number_status','KNOWN'), 1, now(), now()+interval '7 days')\nON CONFLICT (session_key) DO UPDATE\nSET value = jsonb_set(\n              jsonb_set(wa_session_kv.value,'{phone_e164}',to_jsonb($2::text),true),\n              '{number_status}','\"KNOWN\"', true),\n    version = wa_session_kv.version + 1,\n    updated_at = now(),\n    expires_at = now()+interval '7 days';\n",
+        "options": {
+          "queryReplacement": "={{ $json.sessionid }},{{ $json.candidate_phone_e164 }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1520,
+        -112
+      ],
+      "id": "e743ea8f-ef7e-4d78-8a90-06971fba4822",
+      "name": "KV · UPSERT phone",
+      "credentials": {
+        "postgres": {
+          "id": "DwauFRss86aEyyfD",
+          "name": "n8n database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { ...$('Merge phone from KV (if any)').all(), phone_e164: $('Merge phone from KV (if any)').first().json.candidate_phone_e164 } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1744,
+        -112
+      ],
+      "id": "853bfc6e-6eba-4d47-a6b8-6d1dc395278c",
+      "name": "Adopt phone for this run"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wa_session_kv (session_key, value, version, updated_at, expires_at)\nVALUES ($1, jsonb_build_object('phone_e164',NULL, 'number_status','UNKNOWN'), 1, now(), now()+interval '7 days')\nON CONFLICT (session_key) DO NOTHING;\n",
+        "options": {
+          "queryReplacement": "={{ $json.sessionid }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1520,
+        80
+      ],
+      "id": "30da9511-efe8-4f25-9245-44ff0bdf88b4",
+      "name": "KV · ENSURE UNKNOWN",
+      "credentials": {
+        "postgres": {
+          "id": "DwauFRss86aEyyfD",
+          "name": "n8n database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wa_outbox (session_key, payload)\nVALUES ($1, $2::jsonb)\nRETURNING id;\n",
+        "options": {
+          "queryReplacement": "={{ $('Merge config → env').item.json.sessionid }}, {{ JSON.stringify({ kind:'text', text: $('Merge config → env').item.json.ctx.text || 'OK' }) }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1744,
+        80
+      ],
+      "id": "7a32185b-618e-4326-b253-1e19feebe61e",
+      "name": "Outbox · INSERT (echo)",
+      "credentials": {
+        "postgres": {
+          "id": "DwauFRss86aEyyfD",
+          "name": "n8n database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "function digits(e){ return e ? String(e).replace(/^\\+/, '') : null; }\n\nconst ctx   = $json.ctx || {};\nconst owner = $env.EV_OWNER_JID || '';\nconst allowChatId = String($env.EV_ALLOW_CHATID_SEND || 'false') === 'true';\nconst allowRjid   = String($env.EV_ALLOW_REMOTEJID_SEND || 'false') === 'true';\n\nconst number   = digits($json.phone_e164 || null);\nconst chatId   = (ctx.senderJid && ctx.senderJid !== owner && allowChatId) ? ctx.senderJid : null;\nconst remoteJid= (allowRjid ? ctx.remoteJid : null);\n\nlet payload = null;\nif (number) payload = { number, text: ctx.message_text || 'OK' };\nelse if (chatId) payload = { chatId, text: ctx.message_text || 'OK' };\nelse if (remoteJid) payload = { remoteJid, text: ctx.message_text || 'OK' };\n\nconst can_dispatch = !!payload;\n\nreturn [{ json: { ...$json, dispatch: { can_dispatch, payload } } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1968,
+        -16
+      ],
+      "id": "0324e08b-936f-4ff0-b8f6-e752633eb9b1",
+      "name": "Choose destination & gate to Pedidos"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "3bd82346-4dae-421f-ab30-9fa9728bd6ec",
+              "leftValue": "={{ $json.dispatch.can_dispatch }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2192,
+        -16
+      ],
+      "id": "cfcf77eb-a458-43be-936d-c92b0ff3a276",
+      "name": "¿can_dispatch?"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "BOldIwnyn0XZoC10",
+          "mode": "list",
+          "cachedResultName": "Order IA WhatsAPP"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        2640,
+        -16
+      ],
+      "id": "7cdcda32-5332-479d-bd24-e97cdb6ab74f",
+      "name": "Execute Workflow"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code node (JavaScript) — \"Map Webhook + vCard (+ sessionid)\"\n * Agrega `sessionid = <instance>:<remoteJid>` al envelope.\n */\n\nfunction get(o, p, d = null) {\n  try { return p.split('.').reduce((a, k) => a?.[k], o) ?? d; } catch { return d; }\n}\nfunction e164(s) {\n  if (!s) return null;\n  const d = String(s).replace(/[^\\d+]/g, '');\n  return d ? (d.startsWith('+') ? d : ('+' + d)) : null;\n}\nfunction jidToNumberE164(jid) {\n  if (!jid || !/@s\\.whatsapp\\.net$/i.test(jid)) return null;\n  return e164(jid.split('@')[0]);\n}\nfunction unwrap(input) {\n  const j = input?.json ?? input;\n  if (!j) return {};\n  return j.body && (j.body.event || j.body.instance || j.body.data) ? j.body : j;\n}\nfunction parseVCard(v) {\n  if (!v || typeof v !== 'string') return null;\n  const lines = v.replace(/\\r\\n/g, '\\n').replace(/\\n[ \\t]/g, '').split('\\n').map(s => s.trim()).filter(Boolean);\n  const out = { raw: v, fullName: null, org: null, title: null, emails: [], phones: [], urls: [], address: null };\n  for (const ln of lines) {\n    const [lhs, rhs = ''] = ln.split(/:(.*)/s);\n    if (!lhs) continue;\n    const key = lhs.toUpperCase();\n    if (key.startsWith('FN')) out.fullName = rhs.trim() || out.fullName;\n    else if (key.startsWith('ORG')) out.org = rhs.trim() || out.org;\n    else if (key.startsWith('TITLE')) out.title = rhs.trim() || out.title;\n    else if (key.startsWith('EMAIL')) { if (rhs.trim()) out.emails.push(rhs.trim()); }\n    else if (key.startsWith('TEL')) {\n      const m = lhs.match(/TYPE=([^;:]+)/i);\n      const type = m ? m[1].toUpperCase() : null;\n      const rawPhone = rhs.trim();\n      out.phones.push({ type, value_e164: e164(rawPhone), raw: rawPhone });\n    } else if (key.startsWith('URL')) { if (rhs.trim()) out.urls.push(rhs.trim()); }\n    else if (key.startsWith('ADR')) out.address = rhs.trim() || out.address;\n  }\n  return out;\n}\nfunction extractMessageText(msg) {\n  if (!msg || typeof msg !== 'object') return '';\n  if (msg.conversation) return String(msg.conversation);\n  if (msg.extendedTextMessage?.text) return String(msg.extendedTextMessage.text);\n  if (msg.imageMessage?.caption) return String(msg.imageMessage.caption);\n  if (msg.videoMessage?.caption) return String(msg.videoMessage.caption);\n  if (msg.buttonsResponseMessage?.selectedButtonId) return String(msg.buttonsResponseMessage.selectedButtonId);\n  if (msg.listResponseMessage?.singleSelectReply?.selectedRowId) return String(msg.listResponseMessage.singleSelectReply.selectedRowId);\n  if (msg.templateButtonReplyMessage?.selectedId) return String(msg.templateButtonReplyMessage.selectedId);\n  return 'HOLA';\n}\nfunction collectNumberCandidates({ vcardObj, participant, quotedPart, mentioned, senderJid, text }) {\n  const cands = [];\n  if (vcardObj?.phones?.length) for (const ph of vcardObj.phones) if (ph.value_e164) cands.push({ source: 'vcard', phone_e164: ph.value_e164 });\n  const candP = jidToNumberE164(participant); if (candP) cands.push({ source: 'participant', phone_e164: candP });\n  const candQ = jidToNumberE164(quotedPart); if (candQ) cands.push({ source: 'quoted.participant', phone_e164: candQ });\n  if (Array.isArray(mentioned)) for (const mj of mentioned) { const num = jidToNumberE164(mj); if (num) cands.push({ source: 'mentioned', phone_e164: num }); }\n  const candS = jidToNumberE164(senderJid); if (candS) cands.push({ source: 'senderJid', phone_e164: candS });\n  if (text) { const m = text.match(/(\\+?\\d{8,15})/); if (m) { const e = e164(m[1]); if (e) cands.push({ source: 'text', phone_e164: e }); } }\n  const seen = new Set();\n  return cands.filter(x => { const k = x.phone_e164; if (!k || seen.has(k)) return false; seen.add(k); return true; });\n}\n\n/* MAIN */\nconst out = [];\nfor (const item of $input.all()) {\n  const body = unwrap(item);\n  const headers = item.json?.headers || item.headers || body.headers || null;\n\n  const instance   = body.instance || get(body, 'data.instance');\n  const data       = body.data || {};\n  const msg        = data.message || {};\n  const ctxInfo    = msg?.extendedTextMessage?.contextInfo || {};\n\n  const remoteJid  = get(body, 'data.key.remoteJid');\n  const senderJid  = body.sender || null;\n  const messageId  = get(body, 'data.key.id') || null;\n  const fromMe     = !!get(body, 'data.key.fromMe', false);\n  const pushName   = body.pushName || data.pushName || null;\n  const source     = body.source || null;\n\n  const messageType = body.messageType || (msg.conversation ? 'conversation' : Object.keys(msg)[0] || null);\n  const tsEpoch      = Number(body.messageTimestamp || get(body,'data.messageTimestamp')) || null;\n  const tsIso        = tsEpoch ? new Date(tsEpoch * 1000).toISOString() : (body.date_time || null);\n\n  const text = extractMessageText(msg);\n\n  const isVCard       = !!msg?.contactMessage?.vcard;\n  const vcardRaw      = isVCard ? String(msg.contactMessage.vcard) : null;\n  const participant   = get(body, 'data.key.participant') || null;\n  const quotedPart    = get(ctxInfo, 'quotedMessage.key.participant') || null;\n  const mentionedJids = Array.isArray(ctxInfo?.mentionedJid) ? ctxInfo.mentionedJid : [];\n\n  const vcardObj = vcardRaw ? parseVCard(vcardRaw) : null;\n  const number_candidates = collectNumberCandidates({ vcardObj, participant, quotedPart, mentioned: mentionedJids, senderJid, text });\n\n  const sessionid = (instance && remoteJid) ? `${instance}:${remoteJid}` : `${instance || 'unknown'}:${remoteJid || 'unknown'}`;\n\n  const envelope = {\n    sessionid,\n    //headers: headers || null,\n    tenant: { instance: instance || null },\n    ctx: {\n      remoteJid, senderJid, messageId, messageType,\n      text, fromMe, ts_epoch: tsEpoch, ts_iso: tsIso,\n      pushName, source\n    },\n    signals: {\n      isVCard,\n      hasParticipant: !!participant,\n      hasQuotedParticipant: !!quotedPart,\n      hasMentionedJids: mentionedJids.length > 0\n    },\n    vcard: vcardObj,\n    number_candidates,\n    raw: {\n      destination: body.destination || null,\n      webhookUrl: item.json?.webhookUrl || body.webhookUrl || null\n    }\n  };\n\n  out.push({ json: envelope });\n}\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -48,
+        -16
+      ],
+      "id": "ec260f8e-055e-4efa-aba2-1cd6b642ecf5",
+      "name": "Init envelope"
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $input.first().json;\nif (!row) throw new Error('tenant_config no encontrado para instance');\nconst env = {\n  evo_base: row.evo_base,\n  evo_key: row.evo_key,\n  allow_chatId: row.allow_chatid,\n  allow_lid: row.allow_lid,\n  owner_jid: row.owner_jid || ''\n};\nreturn [{ json: { ...$('Init envelope').first().json, tenant: { id: row.id, instance: row.instance }, env } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        -16
+      ],
+      "id": "7f4b63c1-c85c-48a7-bd70-3749de48b3c6",
+      "name": "Merge config → env"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, instance, evo_base, evo_key, allow_chatid, allow_lid, owner_jid, extra\nFROM tenant_config\nWHERE instance = $1;\n",
+        "options": {
+          "queryReplacement": "={{ $json.tenant.instance }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        176,
+        -16
+      ],
+      "id": "dba4b18f-07f2-4232-b11e-9a93e0a1a00e",
+      "name": "Load tenant config",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "DwauFRss86aEyyfD",
+          "name": "n8n database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const inner = $json[\"0\"]?.json;\nreturn inner ?? $json; // si no existe, deja lo que había\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2416,
+        -16
+      ],
+      "id": "5ed7a07b-5d71-4609-b06a-1dd157fcaed8",
+      "name": "Fix json"
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "={{ $json.instance }}",
+        "remoteJid": "={{ $json.number }}",
+        "messageText": "={{ $json.respuesta }}",
+        "options_message": {}
+      },
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        2864,
+        -16
+      ],
+      "id": "af19ad3b-16e1-48bf-831c-fd13b1b94d1a",
+      "name": "Enviar texto",
+      "credentials": {
+        "evolutionApi": {
+          "id": "0ra4P6NJQMjjvkFw",
+          "name": "Evolution account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ffdb505b-d32a-42d0-956f-488ec9848334",
+              "leftValue": "={{ $json.body.data.status }}",
+              "rightValue": "ERROR",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            },
+            {
+              "id": "09f76449-ac88-4e16-92b5-086794f17159",
+              "leftValue": "={{ $json.body.data.key.fromMe }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -272,
+        -16
+      ],
+      "id": "0f386d22-f34d-4c13-983e-fffafaff5f30",
+      "name": "If"
+    }
+  ],
+  "pinData": {
+    "Evolution Inbound": [
+      {
+        "json": {
+          "headers": {
+            "host": "n8n-production-933e.up.railway.app",
+            "user-agent": "axios/1.7.9",
+            "content-length": "911",
+            "accept-encoding": "gzip, compress, deflate, br",
+            "content-type": "application/json",
+            "x-forwarded-for": "162.220.234.68",
+            "x-forwarded-host": "n8n-production-933e.up.railway.app",
+            "x-forwarded-proto": "https",
+            "x-railway-edge": "railway/us-east4-eqdc4a",
+            "x-railway-request-id": "pQhWSwEzQ867lKSzAax-fw",
+            "x-real-ip": "162.220.234.68",
+            "x-request-start": "1756504868336"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "messages.upsert",
+            "instance": "OrderAI-project",
+            "data": {
+              "key": {
+                "remoteJid": "27822898864179@lid",
+                "fromMe": false,
+                "id": "E69C539478C81C7250C855BF51066858"
+              },
+              "pushName": "Ailin Ferreiro",
+              "status": "DELIVERY_ACK",
+              "message": {
+                "conversation": "1220 x 1\n2133 x2\n481 x5",
+                "messageContextInfo": {
+                  "deviceListMetadata": {
+                    "senderTimestamp": "1754018714",
+                    "recipientKeyHash": "Etk0nFmCkJdsPQ==",
+                    "recipientTimestamp": "1756303691"
+                  },
+                  "deviceListMetadataVersion": 2,
+                  "messageSecret": "5jhTWTTMQ34Dw83F0N3D1DqGQU8cX/qNYHmQlOldSbY="
+                }
+              },
+              "messageType": "conversation",
+              "messageTimestamp": 1756504867,
+              "instanceId": "dacf7813-f169-468d-9968-e74915b5693c",
+              "source": "android"
+            },
+            "destination": "https://n8n-production-933e.up.railway.app/webhook/evo/inbound",
+            "date_time": "2025-08-29T19:01:08.332Z",
+            "sender": "34643930568@s.whatsapp.net",
+            "server_url": "https://evolution-api-production-d3aa.up.railway.app",
+            "apikey": "31E3869E4677-46CF-854E-01445E5425EC"
+          },
+          "webhookUrl": "http://n8n-production-933e.up.railway.app/webhook/evo/inbound",
+          "executionMode": "production"
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Evolution Inbound": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "KV · GET phone": {
+      "main": [
+        [
+          {
+            "node": "Signals → candidate_phone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge phone from KV (if any)": {
+      "main": [
+        [
+          {
+            "node": "¿Hay candidate_phone?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Signals → candidate_phone": {
+      "main": [
+        [
+          {
+            "node": "Merge phone from KV (if any)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Hay candidate_phone?": {
+      "main": [
+        [
+          {
+            "node": "KV · UPSERT phone",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "KV · ENSURE UNKNOWN",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "KV · UPSERT phone": {
+      "main": [
+        [
+          {
+            "node": "Adopt phone for this run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "KV · ENSURE UNKNOWN": {
+      "main": [
+        [
+          {
+            "node": "Outbox · INSERT (echo)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Outbox · INSERT (echo)": {
+      "main": [
+        [
+          {
+            "node": "Choose destination & gate to Pedidos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Choose destination & gate to Pedidos": {
+      "main": [
+        [
+          {
+            "node": "¿can_dispatch?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿can_dispatch?": {
+      "main": [
+        [
+          {
+            "node": "Fix json",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Execute Workflow": {
+      "main": [
+        [
+          {
+            "node": "Enviar texto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init envelope": {
+      "main": [
+        [
+          {
+            "node": "Load tenant config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge config → env": {
+      "main": [
+        [
+          {
+            "node": "KV · GET phone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load tenant config": {
+      "main": [
+        [
+          {
+            "node": "Merge config → env",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt phone for this run": {
+      "main": [
+        [
+          {
+            "node": "Choose destination & gate to Pedidos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fix json": {
+      "main": [
+        [
+          {
+            "node": "Execute Workflow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Init envelope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "3278ebe6-4760-48c9-8fc4-791d2e885e4b",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "1d7362d284dc2a16608f665f1232d156b9390dd8f81024bce6d3fa7ee4a4624b"
+  },
+  "id": "Cb6LGsI8bAcZN5P9",
+  "tags": []
+}
